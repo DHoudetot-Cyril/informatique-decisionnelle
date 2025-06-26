@@ -1,43 +1,72 @@
 import pandas as pd
+import mysql.connector
 from sqlalchemy import create_engine
 
-# Connexion à la base MariaDB
-user = "root"
-password = ""
-host = "127.0.0.1"
-port = 3307
-database = "info_money"
+# Configuration des connexions
+source_config = {
+    'host': "127.0.0.1",
+    'port': 3307,
+    'user': 'root',
+    'password': '',
+    'database': 'money'
+}
 
-engine = create_engine(f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}")
+target_config = {
+    'host': "127.0.0.1",
+    'port': 3307,
+    'user': 'root',
+    'password': '',
+    'database': 'dw_money'
+}
 
-# Liste des vues ou tables à extraire
-views_or_tables = [
-    "V_MOUVEMENT",
-    "V_CATEGORIE",
-    "Utilisateur",
-    "Compte",
-    "Tiers",
-    "Virement",
-    "Mouvement"
-]
+# Connexion source/destination
+source_conn = mysql.connector.connect(**source_config)
+target_engine = create_engine(f"mysql+mysqlconnector://{target_config['user']}:{target_config['password']}@{target_config['host']}:{target_config['port']}/{target_config['database']}")
 
-# Dossier de sortie pour les fichiers CSV
-output_dir = "./exports_powerbi"
+# Extraction des données 
+df_mouvements = pd.read_sql("SELECT * FROM V_MOUVEMENT", source_conn)
 
-import os
-os.makedirs(output_dir, exist_ok=True)
 
-# Extraction + Transformation (optionnelle) + Chargement
-for table in views_or_tables:
-    df = pd.read_sql(f"SELECT * FROM {table}", engine)
-    
-    # Exemple de transformation simple : format date
-    for col in df.columns:
-        if "date" in col.lower():
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-    
-    # Sauvegarde en CSV
-    df.to_csv(f"{output_dir}/{table}.csv", index=False)
-    print(f"{table} exporté vers CSV")
 
-print("✅ ETL terminé. Importez les fichiers dans Power BI.")
+## DimCompte
+dim_compte = df_mouvements[['descriptionCompte', 'nomBanque']].drop_duplicates().reset_index(drop=True)
+dim_compte['idCompteDim'] = dim_compte.index + 1
+
+## DimTiers
+dim_tiers = df_mouvements[['nomTiers']].drop_duplicates().reset_index(drop=True)
+dim_tiers['idTiersDim'] = dim_tiers.index + 1
+
+## DimCategorie
+dim_categorie = df_mouvements[['nomCategorie', 'nomSousCategorie']].drop_duplicates().reset_index(drop=True)
+dim_categorie['idCategorieDim'] = dim_categorie.index + 1
+
+## DimTemps
+dim_temps = df_mouvements[['dateMouvement']].drop_duplicates().reset_index(drop=True)
+dim_temps['idTemps'] = dim_temps.index + 1
+dim_temps['annee'] = pd.to_datetime(dim_temps['dateMouvement']).dt.year
+dim_temps['mois'] = pd.to_datetime(dim_temps['dateMouvement']).dt.month
+dim_temps['jour'] = pd.to_datetime(dim_temps['dateMouvement']).dt.day
+
+# Création de la table de faits
+df_faits = df_mouvements.copy()
+
+# Jointures pour les ID des dimensions
+df_faits = df_faits.merge(dim_compte, on=['descriptionCompte', 'nomBanque'], how='left')
+df_faits = df_faits.merge(dim_tiers, on='nomTiers', how='left')
+df_faits = df_faits.merge(dim_categorie, on=['nomCategorie', 'nomSousCategorie'], how='left')
+df_faits = df_faits.merge(dim_temps, on='dateMouvement', how='left')
+
+# Table de faits finale
+fact_mouvements = df_faits[[
+    'idMouvement', 'montant',
+    'idCompteDim', 'idTiersDim', 'idCategorieDim', 'idTemps'
+]]
+
+# insertion dans la base cible
+dim_compte.to_sql('DimCompte', con=target_engine, if_exists='replace', index=False)
+dim_tiers.to_sql('DimTiers', con=target_engine, if_exists='replace', index=False)
+dim_categorie.to_sql('DimCategorie', con=target_engine, if_exists='replace', index=False)
+dim_temps.to_sql('DimTemps', con=target_engine, if_exists='replace', index=False)
+fact_mouvements.to_sql('FaitsMouvements', con=target_engine, if_exists='replace', index=False)
+
+print(" ETL terminé.")
